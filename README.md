@@ -176,5 +176,3 @@ _Before using this project, in any form, you should properly test the evasion fe
 ### Cobalt Strike C2 Profiles
 + [Tylous's epic SourcePoint project](https://github.com/Tylous/SourcePoint)
 + [threatexpress/malleable-c2/jquery-c2.4.7.profile](https://raw.githubusercontent.com/threatexpress/malleable-c2/master/jquery-c2.4.7.profile)
-
-
